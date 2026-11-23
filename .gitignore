@@ -1,0 +1,10 @@
+# generated models and data
+*.stl
+*.tif
+*.tif.aux.xml
+*.png
+!docs/*.png
+
+__pycache__/
+.pytest_cache/
+*.pyc
