@@ -12,7 +12,7 @@ download the multi-gigabyte source tiles.
   and the layer heights for filament changes
 
 ![Examples](docs/examples.png)
-*Examples rendered on synthetic test terrain.*
+*Example output of `dgm3d.py view --mode all`.*
 
 ## Install
 
@@ -63,6 +63,55 @@ settings without downloading again, rebuild from that file:
   height.
 - `--bands` prints the layer heights in mm at which to change filament, for example green,
   then grey, then white.
+
+### Buildings
+
+```bash
+# a few blocks in Vienna-Donaustadt, ~1:3,400 on a 175 mm print
+./dgm3d.py fetch 16.48334 48.21499 16.49131 48.21798 donaustadt.stl \
+    --dem-res 1 --width 175 --res 0.2 --exag 1 --base 2 --buildings
+```
+
+`--buildings` adds three things to the terrain:
+
+1. The BEV **surface model** (ALS-DSM, 1 m, CC BY 4.0), fetched on the same grid as the
+   terrain model.
+2. The **building footprints** from the BEV landscape model (DLM Bauwerke, CC BY 4.0). They
+   are read remotely with a spatial filter and rasterised. Inside a footprint the model uses
+   the surface height, which gives real roof shapes. Everywhere else it uses the terrain
+   height, so trees are left out.
+3. Two extra bodies for multi-colour printing: `_terrain.stl` and `_buildings.stl`. Together
+   they make up the full model.
+
+Buildings only work at large scales. With a 0.4 mm nozzle, anything narrower than about
+0.8 mm on the print will not come out cleanly, and the tool prints that limit in metres.
+Use areas of roughly 0.3–2 km.
+
+Options:
+
+- `--footprints FILE|URL` uses other building polygons. `--footprints none` takes everything
+  more than 2.5 m above ground, trees included.
+- `--footprint-where` and `--footprint-layers` select features or layers.
+- `DLM_BUILDINGS=<url>` points to a newer DLM release.
+
+**Vienna's own surface model (50 cm).** The City of Vienna (MA 41) publishes its surface model
+at 50 cm resolution under CC BY 4.0, in 2.5 × 2.5 km sheets. To use it:
+
+1. Open the [Geodatenviewer](https://www.wien.gv.at/ma41datenviewer/public/start.aspx).
+2. Under *Geodaten Download*, select *Oberflächenmodell (DOM)*.
+3. Click the sheet(s) covering your area and download the TIF files.
+
+Then pass them to dgm3d:
+
+```bash
+./dgm3d.py fetch 16.48334 48.21499 16.49131 48.21798 donaustadt.stl \
+    --dem-res 0.5 --width 175 --res 0.2 --exag 1 --base 2 \
+    --buildings --dsm-files dom_*.tif --dsm-srs EPSG:31256
+```
+
+Vienna's heights are given relative to *Wiener Null*, not sea level. dgm3d matches the open
+ground of the city's model to the BEV terrain model and prints the offset it found (about
++156.7 m). Credit: *Höhendaten: © Stadt Wien – data.wien.gv.at, CC BY 4.0, bearbeitet*.
 
 ### Views from a standpoint
 
@@ -117,6 +166,16 @@ For a commercial license, please get in touch.
 
 The **elevation data** is not covered by this license. It remains under CC BY 4.0 from BEV
 (see above).
+
+## README image
+
+`tools/readme_image.py` combines the previews of a `view --mode all` run into one picture
+(needs matplotlib):
+
+```bash
+./dgm3d.py view --lat 47.0748 --lon 12.7506 --az 268 --fov 60 --dist 12 --mode all --out fjh
+tools/readme_image.py fjh --title "Großglockner from the Kaiser-Franz-Josefs-Höhe"
+```
 
 ## Development
 

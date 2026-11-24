@@ -22,24 +22,31 @@ Examples
 Requires numpy and the GDAL Python bindings (Fedora: sudo dnf install python3-gdal python3-numpy);
 scipy is optional (removes tiny islands with --crop).
 
+  ./dgm3d.py fetch 16.48334 48.21499 16.49131 48.21798 donaustadt.stl --dem-res 1 --width 175 \
+             --exag 1 --base 2 --buildings          # + BEV surface model & building footprints
+
 Code:  PolyForm Noncommercial 1.0.0 — https://github.com/elronzo/dgm3d
 Data:  © BEV – Bundesamt für Eich- und Vermessungswesen, CC BY 4.0 — https://data.bev.gv.at
+       Vienna surface model (--dsm-files): © Stadt Wien – data.wien.gv.at, CC BY 4.0
 """
 import argparse, math, os, struct, sys
 import numpy as np
 from osgeo import gdal, osr
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 gdal.UseExceptions()
 
-STAND = os.environ.get("STAND", "20230915")
-BASE_URL = os.environ.get("BASE", f"https://data.bev.gv.at/download/ALS/DTM/{STAND}")
+RELEASES = [os.environ["STAND"]] if os.environ.get("STAND") else ["20240915", "20230915"]
+BEV_ROOT = os.environ.get("BEV_ROOT", "https://data.bev.gv.at/download/ALS")
+BASE_URL = os.environ.get("BASE")            # override for tests/mirrors: folder containing the tiles
+DLM_BUILDINGS = os.environ.get(
+    "DLM_BUILDINGS", "https://data.bev.gv.at/download/DLM/DLM_20250325/DLM_8000_BAUWERK_20250325.gpkg")
 TILE = 50_000
 R_EARTH, REFRACTION = 6_371_000.0, 0.13
 
 for k, v in {"GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
-             "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif",
+             "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.gpkg,.fgb,.geojson,.json,.shp,.shx,.dbf,.prj",
              "VSI_CACHE": "TRUE", "VSI_CACHE_SIZE": "200000000",
              "GDAL_HTTP_MULTIRANGE": "YES",
              "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES"}.items():
@@ -69,44 +76,198 @@ def lonlat_to(target, pts):
 
 # ───────────────────────────── fetch ──────────────────────────────
 
-def fetch(w, s, e, n, out_tif, res=1.0):
-    """Clip a WGS84 bbox out of the BEV 1 m DTM tiles into a GeoTIFF (EPSG:3035)."""
+def bbox_3035(w, s, e, n):
     xy = lonlat_to(3035, [(w, s), (w, n), (e, s), (e, n)])
     xmin, ymin = np.floor(xy.min(0)).astype(int)
     xmax, ymax = np.ceil(xy.max(0)).astype(int)
-    log(f"bbox EPSG:3035  E {xmin}–{xmax}  N {ymin}–{ymax}  ({xmax-xmin} × {ymax-ymin} m)")
+    return int(xmin), int(ymin), int(xmax), int(ymax)
 
-    # probe one ring of neighbouring 50 km tiles (works for either corner convention)
-    inputs = []
-    for ty in range(ymin // TILE * TILE - TILE, ymax // TILE * TILE + TILE + 1, TILE):
-        for tx in range(xmin // TILE * TILE - TILE, xmax // TILE * TILE + TILE + 1, TILE):
-            for name in (f"ALS_DTM_CRS3035RES50000mN{ty}E{tx}.tif", f"CRS3035RES50000mN{ty}E{tx}.tif"):
-                url = f"/vsicurl/{BASE_URL}/{name}"
-                try:
-                    ds = gdal.Open(url)
-                except RuntimeError:
-                    continue
-                gt = ds.GetGeoTransform()
-                txmin, tymax = gt[0], gt[3]
-                txmax, tymin = txmin + gt[1] * ds.RasterXSize, tymax + gt[5] * ds.RasterYSize
-                if txmin < xmax and txmax > xmin and tymin < ymax and tymax > ymin:
-                    ovr = ds.GetRasterBand(1).GetOverviewCount()
-                    log(f"  tile {name}  ({ovr} overviews)")
-                    if res >= 20 and ovr == 0:
-                        log("  warning: no overviews — a coarse fetch must read every 1 m pixel; this will be slow")
-                    inputs.append(url)
-                break
-    if not inputs:
-        sys.exit(f"No BEV tile found — bbox outside Austria, or no release at {BASE_URL}/ "
-                 "(set STAND=YYYYMMDD for a newer one)")
 
-    gdal.Warp(out_tif, inputs, dstSRS="EPSG:3035", dstNodata=-9999,
-              outputBounds=(xmin, ymin, xmax, ymax), xRes=res, yRes=res, targetAlignedPixels=True,
-              resampleAlg="bilinear" if res <= 1 else "average", multithread=True,
+def find_tiles(product, bounds, res):
+    """Locate the BEV 50 km tiles (product DTM or DSM) covering bounds; tries the known releases."""
+    xmin, ymin, xmax, ymax = bounds
+    folders = [BASE_URL] if BASE_URL else [f"{BEV_ROOT}/{product}/{r}" for r in RELEASES]
+    for folder in folders:
+        inputs = []
+        # probe one ring of neighbouring tiles (works for either corner convention)
+        for ty in range(ymin // TILE * TILE - TILE, ymax // TILE * TILE + TILE + 1, TILE):
+            for tx in range(xmin // TILE * TILE - TILE, xmax // TILE * TILE + TILE + 1, TILE):
+                for name in (f"ALS_{product}_CRS3035RES50000mN{ty}E{tx}.tif", f"CRS3035RES50000mN{ty}E{tx}.tif"):
+                    url = f"/vsicurl/{folder}/{name}"
+                    try:
+                        ds = gdal.Open(url)
+                    except RuntimeError:
+                        continue
+                    gt = ds.GetGeoTransform()
+                    txmin, tymax = gt[0], gt[3]
+                    txmax, tymin = txmin + gt[1] * ds.RasterXSize, tymax + gt[5] * ds.RasterYSize
+                    if txmin < xmax and txmax > xmin and tymin < ymax and tymax > ymin:
+                        ovr = ds.GetRasterBand(1).GetOverviewCount()
+                        log(f"  {product} tile {folder.rsplit('/', 1)[-1]}/{name}  ({ovr} overviews)")
+                        if res >= 20 and ovr == 0:
+                            log("  warning: no overviews — a coarse fetch must read every 1 m pixel; slow")
+                        inputs.append(url)
+                    break
+        if inputs:
+            return inputs
+    sys.exit(f"No BEV {product} tile found — bbox outside Austria, or no release in {folders} "
+             "(set STAND=YYYYMMDD)")
+
+
+def warp_to_grid(inputs, out_tif, bounds, res, src_srs=None, resample=None):
+    """Mosaic + reproject inputs onto the common EPSG:3035 grid given by bounds/res."""
+    gdal.Warp(out_tif, inputs, dstSRS="EPSG:3035", srcSRS=src_srs, dstNodata=-9999,
+              outputBounds=bounds, xRes=res, yRes=res, targetAlignedPixels=True,
+              resampleAlg=resample or ("bilinear" if res <= 1 else "average"), multithread=True,
               warpOptions=["NUM_THREADS=ALL_CPUS"],
               creationOptions=["COMPRESS=DEFLATE", "PREDICTOR=3", "TILED=YES"])
+    return out_tif
+
+
+def fetch(w, s, e, n, out_tif, res=1.0, product="DTM"):
+    """Clip a WGS84 bbox out of the BEV 1 m tiles (DTM or DSM) into a GeoTIFF (EPSG:3035)."""
+    bounds = bbox_3035(w, s, e, n)
+    xmin, ymin, xmax, ymax = bounds
+    log(f"bbox EPSG:3035  E {xmin}–{xmax}  N {ymin}–{ymax}  ({xmax-xmin} × {ymax-ymin} m)")
+    warp_to_grid(find_tiles(product, bounds, res), out_tif, bounds, res)
     log(f"GeoTIFF → {out_tif}")
     return out_tif
+
+
+# ───────────────────────────── buildings ──────────────────────────────
+
+def footprint_mask(src, like_tif, out_tif, where=None, layers=None):
+    """Rasterise building polygons (any OGR source; http(s) is read remotely with a spatial filter)
+    onto the grid of like_tif. Returns the number of polygons burnt in."""
+    from osgeo import ogr
+    ogr.UseExceptions()
+    path = f"/vsicurl/{src}" if src.startswith(("http://", "https://")) else src
+    ref = gdal.Open(like_tif)
+    gt, nx, ny = ref.GetGeoTransform(), ref.RasterXSize, ref.RasterYSize
+    mem = gdal.GetDriverByName("GTiff").Create(out_tif, nx, ny, 1, gdal.GDT_Byte, ["COMPRESS=DEFLATE"])
+    mem.SetGeoTransform(gt)
+    mem.SetProjection(ref.GetProjection())
+    target = srs(ref.GetProjection())
+    xmin, ymax = gt[0], gt[3]
+    xmax, ymin = xmin + gt[1] * nx, ymax + gt[5] * ny
+    vds = ogr.Open(path)
+    names = [vds.GetLayerByIndex(i).GetName() for i in range(vds.GetLayerCount())]
+    if not layers:
+        # BEV DLM: buildings are in *_BAUWERK_F; other polygon layers (e.g. *_AKTUALITAETSSTAND,
+        # a coverage outline) must not be burnt in
+        layers = [n for n in names if n.upper().endswith("BAUWERK_F")] or \
+                 [n for n in names if "AKTUALITAET" not in n.upper()]
+    total = 0
+    for i in range(vds.GetLayerCount()):
+        lyr = vds.GetLayerByIndex(i)
+        if lyr.GetName() not in layers:
+            continue
+        if ogr.GT_Flatten(lyr.GetGeomType()) not in (ogr.wkbPolygon, ogr.wkbMultiPolygon, ogr.wkbUnknown):
+            continue
+        lsrs = lyr.GetSpatialRef()
+        if lsrs is not None:
+            lsrs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+            tr = osr.CoordinateTransformation(target, lsrs)
+            pts = np.array([tr.TransformPoint(x, y)[:2] for x in (xmin, xmax) for y in (ymin, ymax)])
+            lyr.SetSpatialFilterRect(*pts.min(0), *pts.max(0))
+        else:
+            lyr.SetSpatialFilterRect(xmin, ymin, xmax, ymax)
+        if where:
+            lyr.SetAttributeFilter(where)
+        n = lyr.GetFeatureCount()
+        if n <= 0:
+            continue
+        log(f"  footprints: layer {lyr.GetName()}: {n} polygons")
+        gdal.RasterizeLayer(mem, [1], lyr, burn_values=[1])
+        total += n
+    mem.FlushCache()
+    mem = None
+    return total
+
+
+def ground_offset(dtm, dsm, notbuilding):
+    """Vertical offset to add to a foreign DSM so that its open ground matches the DTM
+    (e.g. Vienna's 'Wiener Null' heights → metres above Adriatic). Uses the mode of DTM−DSM."""
+    ok = np.isfinite(dtm) & np.isfinite(dsm)
+    d = (dtm - dsm)[notbuilding & ok]
+    if d.size < 100:                       # hardly any open ground: use all pixels (roofs bias it)
+        log("  warning: too little open ground for the height alignment — using all pixels")
+        d = (dtm - dsm)[ok]
+        if d.size < 100:
+            return 0.0
+    lo, hi = np.percentile(d, [5, 95])
+    hist, edges = np.histogram(d, bins=max(10, int((hi - lo) / 0.1)), range=(lo - 1, hi + 1))
+    k = int(np.argmax(hist))
+    near = d[np.abs(d - (edges[k] + edges[k + 1]) / 2) < 0.5]
+    return float(np.median(near))
+
+
+def resolve_raster_files(items):
+    """Expand globs, look inside .zip files, and fail with a helpful message if nothing is there."""
+    import glob
+    out = []
+    for it in items:
+        hits = sorted(glob.glob(it)) or ([it] if os.path.exists(it) else [])
+        if not hits:
+            sys.exit(f"--dsm-files: '{it}' not found.\n"
+                     "Download the surface-model sheet(s) first — for Vienna: Geodatenviewer "
+                     "https://www.wien.gv.at/ma41datenviewer/public/start.aspx → Geodaten Download → "
+                     "Oberflächenmodell (DOM) → click the sheet → save the TIF (or ZIP).")
+        for h in hits:
+            if h.lower().endswith(".zip"):
+                inner = [f"/vsizip/{h}/{n}" for n in (gdal.ReadDirRecursive(f"/vsizip/{h}") or [])
+                         if n.lower().endswith((".tif", ".tiff", ".asc"))]
+                if not inner:
+                    sys.exit(f"--dsm-files: no .tif/.asc inside {h}")
+                out += inner
+            else:
+                out.append(h)
+    return out
+
+
+def fetch_buildings(tif, bounds, res, dsm_files=None, dsm_srs=None, footprints=None, where=None,
+                    layers=None):
+    """Next to a fetched DTM (tif) write <stem>_dsm.tif (surface heights aligned to the DTM) and
+    <stem>_bldg.tif (building mask) on exactly the same grid."""
+    stem = tif[:-4]
+    dsm_tif, mask_tif = f"{stem}_dsm.tif", f"{stem}_bldg.tif"
+    if dsm_files:
+        dsm_files = resolve_raster_files(dsm_files)
+        log(f"  surface model: {len(dsm_files)} local file(s)")
+        warp_to_grid(dsm_files, dsm_tif, bounds, res, src_srs=dsm_srs)
+    else:
+        warp_to_grid(find_tiles("DSM", bounds, res), dsm_tif, bounds, res)
+
+    src = footprints or DLM_BUILDINGS
+    if src.lower() == "none":
+        dtm, dsm = DEM(tif).z, DEM(dsm_tif).z
+        m = ((dsm - dtm) > 2.5).astype(np.uint8)          # everything taller than 2.5 m (incl. trees!)
+        log("  footprints: none — using height above ground > 2.5 m (trees included)")
+        ref = gdal.Open(tif)
+        out = gdal.GetDriverByName("GTiff").Create(mask_tif, ref.RasterXSize, ref.RasterYSize, 1, gdal.GDT_Byte)
+        out.SetGeoTransform(ref.GetGeoTransform()); out.SetProjection(ref.GetProjection())
+        out.GetRasterBand(1).WriteArray(m); out = None
+    else:
+        n = footprint_mask(src, tif, mask_tif, where, layers)
+        if not n:
+            log("  warning: no building polygons found in this area")
+
+    mask = DEM(mask_tif).z > 0.5
+    if mask.mean() > 0.8:
+        log(f"  warning: {100 * mask.mean():.0f} % of the area is inside 'building' polygons — wrong "
+            "layer? Choose one with --footprint-layers")
+    if dsm_files:   # foreign height datum? align open ground to the DTM
+        dtm = DEM(tif).z
+        ds = gdal.Open(dsm_tif, gdal.GA_Update)
+        b = ds.GetRasterBand(1)
+        z = b.ReadAsArray().astype(np.float64)
+        z[z == -9999] = np.nan
+        off = ground_offset(dtm, z, ~mask)
+        log(f"  surface model height offset: {off:+.2f} m (aligned to the terrain model)")
+        z = np.where(np.isnan(z), -9999, z + off)
+        b.WriteArray(z.astype(np.float32)); ds = None
+    log(f"  → {dsm_tif}, {mask_tif}")
+    return dsm_tif, mask_tif
 
 
 # ───────────────────────────── DEM ──────────────────────────────
@@ -279,8 +440,11 @@ def shade_heights(z, mask=None, az=315, alt=45, scale=1.0):
 # ───────────────────────────── stl ──────────────────────────────
 
 def dem_to_stl(dem_path, out, width=150, exag=1.5, base=3, res=0.25, zmin=None, crop=False,
-               bands=None, layer=0.1, gamma=1.0):
-    dem = DEM(dem_path, max_px=int(width / res) + 1)
+               bands=None, layer=0.1, gamma=1.0, buildings=None):
+    """buildings: (dsm_tif, mask_tif) on the same grid as dem_path → houses on top, plus
+    <out>_terrain.stl and <out>_buildings.stl as two bodies for multi-colour printing."""
+    max_px = int(width / res) + 1
+    dem = DEM(dem_path, max_px=max_px)
     z = dem.z
     valid = ~np.isnan(z)
     if not valid.any():
@@ -307,11 +471,39 @@ def dem_to_stl(dem_path, out, width=150, exag=1.5, base=3, res=0.25, zmin=None, 
         return span * rel ** gamma
 
     top = base + lift(z) * mm_per_m * exag
+    bcells = None
+    if buildings:
+        dsm = DEM(buildings[0], max_px=max_px).z
+        bv = DEM(buildings[1], max_px=max_px).z > 0.5               # vertex is inside a footprint
+        if dsm.shape != z.shape:
+            sys.exit("surface model and terrain model grids differ")
+        bh = np.where(bv & np.isfinite(dsm), np.clip(dsm - z, 0, 400), 0.0)   # height above ground
+        top = top + bh * mm_per_m * exag
+        corners = bv[:-1, :-1].astype(int) + bv[1:, 1:] + bv[:-1, 1:] + bv[1:, :-1]
+        bcells = corners >= 3
+        if bv.any():
+            log(f"  buildings: up to {bh.max():.0f} m above ground, "
+                f"{100 * bcells.mean():.1f} % of the area")
     sx, sy = wm * mm_per_m / (dem.cols - 1), hm * mm_per_m / (dem.rows - 1)
     log(f"  terrain {wm/1000:.2f} × {hm/1000:.2f} km, {z.min():.0f}–{z.max():.0f} m")
     log(f"  print   {wm*mm_per_m:.1f} × {hm*mm_per_m:.1f} × {top.max():.1f} mm "
         f"(1:{1000/mm_per_m:,.0f}, exag {exag}×" + (f", gamma {gamma}" if gamma != 1 else "") + ")")
     write_stl(out, grid_mesh(top, sx, sy, cellmask))
+    if bcells is not None and bcells.any():
+        area = cellmask if cellmask is not None else np.ones_like(bcells)
+        b = bcells & area
+        for _ in range(20):            # partition into two manifold bodies
+            b = no_diagonals(b, keep=area)
+            t = no_diagonals(area & ~b, keep=area)
+            if not (t & b).any():
+                break
+            b &= ~t
+        stem = out[:-4] if out.endswith(".stl") else out
+        write_stl(f"{stem}_terrain.stl", grid_mesh(top, sx, sy, area & ~b))
+        write_stl(f"{stem}_buildings.stl", grid_mesh(top, sx, sy, b))
+        min_mm = 0.8
+        log(f"  note: features narrower than ~{min_mm} mm ({min_mm / mm_per_m:.1f} m at this scale) "
+            "will not print cleanly with a 0.4 mm nozzle")
     if bands:
         log(f"  filament changes (layer {layer} mm) — add in the slicer at these heights:")
         for b in bands:
@@ -531,28 +723,35 @@ def main(argv=None):
         sp.add_argument("--base", type=float, default=3, help="base thickness in mm")
         sp.add_argument("--res", type=float, default=0.25, help="mesh spacing in mm")
 
+    def relief_opts(sp):
+        stl_opts(sp)
+        sp.add_argument("--zmin", type=float, help="height (m) at the top of the base; default lowest point")
+        sp.add_argument("--crop", action="store_true", help="cut the model along the data outline (border)")
+        sp.add_argument("--bands", help="elevations in m for filament changes, e.g. 1000,2500")
+        sp.add_argument("--layer", type=float, default=0.1, help="layer height in mm (for --bands)")
+        sp.add_argument("--gamma", type=float, default=1.0,
+                        help="<1 lifts lowlands relative to peaks (e.g. 0.6); peak height unchanged")
+        sp.add_argument("--buildings", action="store_true",
+                        help="put buildings on top (surface model inside building footprints)")
+
     f = sub.add_parser("fetch", help="cut a bbox from the BEV DGM (→ .tif or .stl)")
     for c in ("west", "south", "east", "north"):
         f.add_argument(c, type=float)
     f.add_argument("out")
     f.add_argument("--dem-res", type=float, default=1, help="DEM resolution in m (default 1)")
-    stl_opts(f)
-    f.add_argument("--zmin", type=float, help="height (m) at the top of the base; default lowest point")
-    f.add_argument("--crop", action="store_true", help="cut the model along the data outline (Austria's border)")
-    f.add_argument("--bands", help="elevations in m for filament changes, e.g. 1000,2500")
-    f.add_argument("--layer", type=float, default=0.1, help="layer height in mm (for --bands)")
-    f.add_argument("--gamma", type=float, default=1.0,
-                   help="<1 lifts lowlands relative to peaks (e.g. 0.6); peak height unchanged")
+    relief_opts(f)
+    g = f.add_argument_group("buildings (with --buildings)")
+    g.add_argument("--dsm-files", nargs="+", metavar="FILE",
+                   help="local surface-model tiles instead of BEV (e.g. Vienna's 50 cm DOM)")
+    g.add_argument("--dsm-srs", help="CRS of --dsm-files if they carry none (Vienna: EPSG:31256)")
+    g.add_argument("--footprints", help="building polygons: file or URL (default: BEV DLM Bauwerke); "
+                                        "'none' = everything >2.5 m above ground, trees included")
+    g.add_argument("--footprint-where", help="OGR attribute filter (SQL WHERE) to select features")
+    g.add_argument("--footprint-layers", nargs="+", metavar="LAYER", help="only these layers")
 
     s = sub.add_parser("stl", help="DEM GeoTIFF → STL")
     s.add_argument("dem"); s.add_argument("out")
-    stl_opts(s)
-    s.add_argument("--zmin", type=float)
-    s.add_argument("--crop", action="store_true", help="cut the model along the data outline")
-    s.add_argument("--bands", help="elevations in m for filament changes, e.g. 1000,2500")
-    s.add_argument("--layer", type=float, default=0.1, help="layer height in mm (for --bands)")
-    s.add_argument("--gamma", type=float, default=1.0,
-                   help="<1 lifts lowlands relative to peaks (e.g. 0.6); peak height unchanged")
+    relief_opts(s)
 
     v = sub.add_parser("view", help="prints of the view from a standpoint")
     v.add_argument("--lat", type=float, required=True)
@@ -589,14 +788,26 @@ def main(argv=None):
 
     a = p.parse_args(argv)
     if a.cmd == "fetch":
+        tif = a.out[:-4] + ".tif" if a.out.endswith(".stl") else a.out
+        fetch(a.west, a.south, a.east, a.north, tif, a.dem_res)
+        bld = None
+        if a.buildings:
+            bld = fetch_buildings(tif, bbox_3035(a.west, a.south, a.east, a.north), a.dem_res,
+                                  dsm_files=a.dsm_files, dsm_srs=a.dsm_srs, footprints=a.footprints,
+                                  where=a.footprint_where, layers=a.footprint_layers)
         if a.out.endswith(".stl"):
-            tif = a.out[:-4] + ".tif"
-            fetch(a.west, a.south, a.east, a.north, tif, a.dem_res)
-            dem_to_stl(tif, a.out, a.width, a.exag, a.base, a.res, a.zmin, a.crop, parse_bands(a.bands), a.layer, a.gamma)
-        else:
-            fetch(a.west, a.south, a.east, a.north, a.out, a.dem_res)
+            dem_to_stl(tif, a.out, a.width, a.exag, a.base, a.res, a.zmin, a.crop,
+                       parse_bands(a.bands), a.layer, a.gamma, bld)
     elif a.cmd == "stl":
-        dem_to_stl(a.dem, a.out, a.width, a.exag, a.base, a.res, a.zmin, a.crop, parse_bands(a.bands), a.layer, a.gamma)
+        bld = None
+        if a.buildings:
+            stem = a.dem[:-4]
+            bld = (f"{stem}_dsm.tif", f"{stem}_bldg.tif")
+            for f_ in bld:
+                if not os.path.exists(f_):
+                    sys.exit(f"{f_} not found — run 'fetch ... --buildings' first")
+        dem_to_stl(a.dem, a.out, a.width, a.exag, a.base, a.res, a.zmin, a.crop,
+                   parse_bands(a.bands), a.layer, a.gamma, bld)
     else:
         cmd_view(a)
 

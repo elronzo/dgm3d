@@ -2,5 +2,6 @@ Required Notice: Copyright Ronald Wimmer (https://github.com/elronzo)
 
 dgm3d is licensed under the PolyForm Noncommercial License 1.0.0 (see LICENSE.md).
 
-Elevation data used by this tool (not part of this repository):
+Data used by this tool (not part of this repository):
 © BEV – Bundesamt für Eich- und Vermessungswesen, CC BY 4.0, https://data.bev.gv.at
+© Stadt Wien – data.wien.gv.at, CC BY 4.0 (Vienna surface model, optional)

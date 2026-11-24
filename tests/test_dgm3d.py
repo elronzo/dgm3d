@@ -252,3 +252,183 @@ def test_fetch_to_stl(tile_server, tmp_path):
                 "--dem-res", "25", "--width", "90", "--res", "0.5"])
     assert (tmp_path / "f.tif").exists()
     assert_closed(read_stl(out))
+
+
+# ───────────────────────────── buildings ──────────────────────────────
+
+# a 1 km² "village" in the middle of the synthetic tile, 1 m resolution
+VX0, VY0 = TILE_E + 10000, TILE_N + 50000 - 10000          # upper-left corner (EPSG:3035)
+VN = 1000
+HOUSES = [(200, 300, 30, 20, 9.0), (500, 500, 60, 40, 18.0), (700, 250, 15, 15, 6.0)]  # col,row,w,h,height
+TREES = [(350, 700), (360, 720), (800, 800)]
+
+
+def village(tmp, dsm_offset=0.0):
+    """Return (dtm_1m, dsm_1m) arrays for the village: DSM = terrain + houses + trees."""
+    dtm_src = write_tile(tmp / "dtm25.tif", synthetic_terrain())
+    ds = gdal.Warp("", str(dtm_src), format="MEM", outputBounds=(VX0, VY0 - VN, VX0 + VN, VY0),
+                   xRes=1, yRes=1, resampleAlg="bilinear")
+    dtm = ds.GetRasterBand(1).ReadAsArray().astype("f4")
+    dsm = dtm.copy()
+    for c, r, w, h, ht in HOUSES:
+        dsm[r:r + h, c:c + w] = dtm[r:r + h, c:c + w] + ht
+    yy, xx = np.mgrid[0:VN, 0:VN]
+    for c, r in TREES:
+        dsm = np.maximum(dsm, dtm + 15 * np.exp(-((xx - c) ** 2 + (yy - r) ** 2) / 30))
+    return dtm, dsm + dsm_offset
+
+
+def write_raster(path, arr, x0, y0, px, epsg=3035, nodata=-9999):
+    ds = gdal.GetDriverByName("GTiff").Create(str(path), arr.shape[1], arr.shape[0], 1, gdal.GDT_Float32)
+    ds.SetGeoTransform((x0, px, 0, y0, 0, -px))
+    if epsg:
+        s = osr.SpatialReference(); s.ImportFromEPSG(epsg); ds.SetProjection(s.ExportToWkt())
+    ds.GetRasterBand(1).WriteArray(arr)
+    ds.GetRasterBand(1).SetNoDataValue(nodata)
+    ds = None
+    return path
+
+
+def write_footprints(path, epsg=31287):
+    """House polygons in Lambert Austria (≠ EPSG:3035, so reprojection is exercised) + a line layer."""
+    from osgeo import ogr
+    ogr.UseExceptions()
+    drv = ogr.GetDriverByName("GPKG")
+    ds = drv.CreateDataSource(str(path))
+    lam = osr.SpatialReference(); lam.ImportFromEPSG(epsg)
+    lam.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    tr = osr.CoordinateTransformation(dgm3d.srs(3035), lam)
+    # like the real BEV DLM: a coverage polygon over everything + the building layer
+    cov = ds.CreateLayer("BWK_8100_AKTUALITAETSSTAND", lam, ogr.wkbPolygon)
+    ring = ogr.Geometry(ogr.wkbLinearRing)
+    for dx, dy in ((-500, 500), (1500, 500), (1500, -1500), (-500, -1500), (-500, 500)):
+        ring.AddPoint_2D(*tr.TransformPoint(VX0 + dx, VY0 + dy)[:2])
+    poly = ogr.Geometry(ogr.wkbPolygon); poly.AddGeometry(ring)
+    f = ogr.Feature(cov.GetLayerDefn()); f.SetGeometry(poly); cov.CreateFeature(f)
+    lyr = ds.CreateLayer("BWK_8100_BAUWERK_F", lam, ogr.wkbPolygon)
+    for c, r, w, h, _ in HOUSES:
+        ring = ogr.Geometry(ogr.wkbLinearRing)
+        for dx, dy in ((0, 0), (w, 0), (w, h), (0, h), (0, 0)):
+            x, y, _ = tr.TransformPoint(VX0 + c + dx, VY0 - r - dy)
+            ring.AddPoint_2D(x, y)
+        poly = ogr.Geometry(ogr.wkbPolygon); poly.AddGeometry(ring)
+        f = ogr.Feature(lyr.GetLayerDefn()); f.SetGeometry(poly); lyr.CreateFeature(f)
+    lines = ds.CreateLayer("bauwerk_linie", lam, ogr.wkbLineString)
+    ln = ogr.Geometry(ogr.wkbLineString)
+    ln.AddPoint_2D(*tr.TransformPoint(VX0, VY0 - 10)[:2]); ln.AddPoint_2D(*tr.TransformPoint(VX0 + 900, VY0 - 10)[:2])
+    f = ogr.Feature(lines.GetLayerDefn()); f.SetGeometry(ln); lines.CreateFeature(f)
+    ds = None
+    return path
+
+
+def mask_at(path, c, r):
+    """Value of a mask raster at village pixel (col c, row r), via the raster's georeference."""
+    d = dgm3d.DEM(str(path))
+    x, y = VX0 + c + 0.5, VY0 - r - 0.5
+    return d.z[int((y - d.gt[3]) / d.gt[5]), int((x - d.gt[0]) / d.gt[1])] > 0.5
+
+
+def village_bbox():
+    w, s = to_lonlat(VX0 + 100, VY0 - VN + 100)
+    e, n = to_lonlat(VX0 + VN - 100, VY0 - 100)
+    return w, s, e, n
+
+
+@pytest.fixture
+def village_server(tmp_path, monkeypatch):
+    srv = tmp_path / "srv"; srv.mkdir()
+    dtm, dsm = village(tmp_path)
+    write_raster(srv / f"ALS_DTM_CRS3035RES50000mN{TILE_N}E{TILE_E}.tif", dtm, VX0, VY0, 1)
+    write_raster(srv / f"ALS_DSM_CRS3035RES50000mN{TILE_N}E{TILE_E}.tif", dsm, VX0, VY0, 1)
+    write_footprints(srv / "bauwerke.gpkg")
+    handler = lambda *a, **k: RangeHandler(*a, directory=str(srv), **k)  # noqa: E731
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    for var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    base = f"http://127.0.0.1:{httpd.server_port}"
+    monkeypatch.setattr(dgm3d, "BASE_URL", base)
+    yield base, dtm, dsm
+    httpd.shutdown()
+
+
+def test_buildings_from_bev(village_server, tmp_path, capsys):
+    base, dtm, dsm = village_server
+    out = tmp_path / "dorf.stl"
+    dgm3d.main(["fetch", *map(str, village_bbox()), str(out), "--dem-res", "1", "--width", "100",
+                "--res", "0.25", "--exag", "1", "--base", "2", "--buildings",
+                "--footprints", f"{base}/bauwerke.gpkg"])
+    err = capsys.readouterr().err
+    assert "layer BWK_8100_BAUWERK_F: 3 polygons" in err
+    assert "AKTUALITAETSSTAND" not in err
+    whole = assert_closed(read_stl(out))
+    terrain = assert_closed(read_stl(tmp_path / "dorf_terrain.stl"))
+    houses = assert_closed(read_stl(tmp_path / "dorf_buildings.stl"))
+    assert terrain + houses == pytest.approx(whole, rel=1e-3)
+    # the tallest house (18 m above ground) shows up …
+    assert abs(float(re.search(r"buildings: up to (\d+) m", err).group(1)) - 18) <= 1
+    mask = dgm3d.DEM(str(tmp_path / "dorf_bldg.tif")).z > 0.5
+    assert mask.sum() == pytest.approx(sum(w * h for _, _, w, h, _ in HOUSES), rel=0.25)
+    # … the 15 m trees do not; the house centres do
+    for c, r in TREES:
+        assert not mask_at(tmp_path / "dorf_bldg.tif", c, r)
+    for c, r, w, h, _ in HOUSES:
+        assert mask_at(tmp_path / "dorf_bldg.tif", c + w // 2, r + h // 2)
+
+
+def test_vienna_local_dsm_with_offset(village_server, tmp_path, capsys):
+    """Vienna-style DSM: other CRS (EPSG:31256), 0.5 m, heights above 'Wiener Null' (−156.68 m),
+    file without CRS → --dsm-srs; the tool must find the offset itself."""
+    base, dtm, dsm = village_server
+    # resample the true DSM to 0.5 m in EPSG:31256, shift by the datum difference
+    src = write_raster(tmp_path / "dsm3035.tif", dsm, VX0, VY0, 1)
+    gk = gdal.Warp("", str(src), format="MEM", dstSRS="EPSG:31256", xRes=0.5, yRes=0.5,
+                   resampleAlg="bilinear", dstNodata=-9999)
+    arr = gk.GetRasterBand(1).ReadAsArray()
+    arr = np.where(arr == -9999, -9999, arr - 156.68).astype("f4")
+    gt = gk.GetGeoTransform()
+    tiles = []
+    h = arr.shape[0] // 2                    # split in two "sheets" like the Vienna download
+    for i, part in enumerate((arr[:h], arr[h:])):
+        tiles.append(str(write_raster(tmp_path / f"wien_dom_{i}.tif", part, gt[0], gt[3] - i * h * 0.5,
+                                      0.5, epsg=None)))
+    out = tmp_path / "wien.stl"
+    dgm3d.main(["fetch", *map(str, village_bbox()), str(out), "--dem-res", "1", "--width", "100",
+                "--res", "0.25", "--exag", "1", "--buildings", "--dsm-files", *tiles,
+                "--dsm-srs", "EPSG:31256", "--footprints", f"{base}/bauwerke.gpkg"])
+    err = capsys.readouterr().err
+    off = float(re.search(r"height offset: ([+-][\d.]+) m", err).group(1))
+    assert off == pytest.approx(156.68, abs=0.3)
+    assert abs(float(re.search(r"buildings: up to (\d+) m", err).group(1)) - 18) <= 1
+    for part in ("", "_terrain", "_buildings"):
+        assert_closed(read_stl(tmp_path / f"wien{part}.stl"))
+
+
+def test_stl_reuses_building_files(village_server, tmp_path):
+    base, _, _ = village_server
+    tif = tmp_path / "d.tif"
+    dgm3d.main(["fetch", *map(str, village_bbox()), str(tif), "--dem-res", "1", "--buildings",
+                "--footprints", f"{base}/bauwerke.gpkg"])
+    dgm3d.main(["stl", str(tif), str(tmp_path / "d2.stl"), "--width", "80", "--res", "0.4", "--buildings"])
+    assert_closed(read_stl(tmp_path / "d2_buildings.stl"))
+
+
+def test_footprints_none_includes_trees(village_server, tmp_path):
+    dgm3d.main(["fetch", *map(str, village_bbox()), str(tmp_path / "n.stl"), "--dem-res", "1",
+                "--width", "80", "--res", "0.4", "--buildings", "--footprints", "none"])
+    for c, r in TREES:
+        assert mask_at(tmp_path / "n_bldg.tif", c, r)    # trees count as "buildings" here
+    assert_closed(read_stl(tmp_path / "n_buildings.stl"))
+
+
+def test_dsm_files_missing_and_zip(tmp_path):
+    with pytest.raises(SystemExit, match="Geodatenviewer"):
+        dgm3d.resolve_raster_files([str(tmp_path / "wien_dom/*.tif")])
+    import zipfile
+    t = write_raster(tmp_path / "sheet.tif", np.ones((10, 10), "f4"), 0, 10, 1, epsg=None)
+    with zipfile.ZipFile(tmp_path / "sheet.zip", "w") as z:
+        z.write(t, "dom/sheet.tif")
+    files = dgm3d.resolve_raster_files([str(tmp_path / "*.zip")])
+    assert files == [f"/vsizip/{tmp_path}/sheet.zip/dom/sheet.tif"]
+    assert gdal.Open(files[0]).RasterXSize == 10
